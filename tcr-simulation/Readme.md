@@ -1,6 +1,6 @@
 # acyeh2023/tcr-simulation
 
-Scripts are used to calculate "selective expanders" (TCRs from a single donor pool that differentially expand between 2 recipients) in Yeh AC et al, 2022.
+Scripts are used to calculate "selective expanders" (TCRs from a single donor pool that differentially expand between 2 recipients) in Yeh AC et al, 2023.
 Please read below for overview of how to run scripts
 
 # Data preparation
