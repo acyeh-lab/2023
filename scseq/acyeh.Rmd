@@ -18,8 +18,8 @@ CDS_DIR <- file.path(ROOT_DIR,   "cds")
 FIG_DIR <- file.path(ROOT_DIR,  "figs_Final")
 
 suppressPackageStartupMessages({
-  library(monocle3) # from trapnell lab
-  library(m3addon) # from furlan lab  manual install
+  library(monocle3) 
+  library(m3addon) 
   library(dplyr)
   library(Matrix)
   library(reticulate)
@@ -33,21 +33,21 @@ suppressPackageStartupMessages({
   library(stringr)
   library(viridis)
   library(parallel)
-  library(scCustomize) #  manual install
-  library(scRepertoire) #  manual install
-  library(SCpubr) #  manual install
+  library(scCustomize) 
+  library(scRepertoire)
+  library(SCpubr) 
   library(forcats)
-  library(ggalluvial) #  manual install with scRepertoire
+  library(ggalluvial)
   library(future)
   library(pbmcapply)
   library(msigdbr)
   library(fgsea)
-  library(harmony) #  manual install
+  library(harmony) 
   library(circlize)
   library(scales)
-  library(clusterProfiler) # For enricher function
+  library(clusterProfiler)
   library(tibble)
-  library(SeuratDisk) # needed for running scrublet in python
+  library(SeuratDisk) 
 
 })
 set.seed(1234)
