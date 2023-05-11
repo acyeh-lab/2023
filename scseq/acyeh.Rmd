@@ -1,0 +1,702 @@
+
+---
+title: "cdsi Load"
+author: ACY
+output: html_myeebook
+editor_options: 
+  chunk_output_type: console
+---
+```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=F}
+rm(list=ls()) # deletes everything
+
+ROOT_DIR<-"/fh/fast/furlan_s/experiments/Albert/AY_cBir7" # is where Scott places the files
+# For miy files: "/fh/fast/ayeh/10x/experiments/AY_cBir_230228" #
+DATA_DIR <- file.path(ROOT_DIR, "data")     
+RES_DIR  <- file.path(ROOT_DIR,  "res")    
+RMD_DIR  <- file.path(ROOT_DIR,  "rmd")    
+CDS_DIR <- file.path(ROOT_DIR,   "cds")
+FIG_DIR <- file.path(ROOT_DIR,  "figs_Final")
+
+suppressPackageStartupMessages({
+  library(monocle3) # from trapnell lab
+  library(m3addon) # from furlan lab  manual install
+  library(dplyr)
+  library(Matrix)
+  library(reticulate)
+  library(ggplot2)
+  library(pals)
+  library(RColorBrewer)
+  library(Seurat)
+  library(ComplexHeatmap)
+  library(ArchR)
+  library(Biobase)
+  library(stringr)
+  library(viridis)
+  library(parallel)
+  library(scCustomize) #  manual install
+  library(scRepertoire) #  manual install
+  library(SCpubr) #  manual install
+  library(forcats)
+  library(ggalluvial) #  manual install with scRepertoire
+  library(future)
+  library(pbmcapply)
+  library(msigdbr)
+  library(fgsea)
+  library(harmony) #  manual install
+  library(circlize)
+  library(scales)
+  library(clusterProfiler) # For enricher function
+  library(tibble)
+  library(SeuratDisk) # needed for running scrublet in python
+
+})
+set.seed(1234)
+dyn.load('/app/software/ArrayFire/3.8.1/lib64/libaf.so.3')
+library(RcppArrayFire)
+library(viewmastR) # https://github.com/scfurl/viewmaster
+
+clus_cols<-sfc(16)
+rna_cols<-paletteContinuous(n=8)[c(1:3, 6:8)]
+
+```
+
+#Make Object
+read cell ranger output. i like to use the h5 file
+```{r load data make assays}
+# Load the dataset
+seul <- Read10X_h5(file.path(DATA_DIR, "AY_cBIR_1", "outs/per_sample_outs/AY_cBIR_1/count/sample_filtered_feature_bc_matrix.h5"))
+# Has all the data - filtered by cell ranger. VDJ is a separate file
+
+rna_mat<-seul$`Gene Expression`
+# Initialize the Seurat object with the raw (non-normalized data).
+
+seu <- CreateSeuratObject(counts = seul$`Gene Expression`, project = "cBIR", min.cells = 3, min.features = 200)
+#https://satijalab.org/seurat/articles/pbmc3k_tutorial.html uses 3 for min.cells and 200 for min.features
+```
+
+```{r - fsgea function; run this before GSEA analysis}
+plot_fsgea_bargraph<-function(genedb, genelist_wilcox, cluster, dbname, NES_cutoff, height=10, width=10){
+#The NES cutoff plots only gene sets above a certain NES
+    fgsea_sets<- genedb %>% split(x = .$gene_symbol, f = .$gs_name) #Collects names of the genes of interest
+  genes<- genelist_wilcox %>%
+    dplyr::filter(group == cluster) %>%
+    arrange(desc(auc)) %>% 
+    dplyr::select(feature, auc)
+  ranks<- deframe(genes) #Restructures based on tibble package
+  
+  fgseaRes<- fgsea(fgsea_sets, stats = ranks, nperm = 1000)
+  fgseaResTidy <- fgseaRes %>%
+    as_tibble() %>%
+    arrange(desc(NES))
+  results <- do.call(cbind, fgseaResTidy[,1:5])
+  write.csv(results, file.path(FIG_DIR, paste0("[Suppl] GSEA - ", dbname, " - Group ", cluster, ".csv")))
+  fgseaResTidy$pathway<-gsub("HALLMARK_","",fgseaResTidy$pathway)
+  
+  pdf(file.path(FIG_DIR, paste0("[Suppl] - GSEA_Enrichment" , dbname,  "_Gp", cluster," ALL sigp with NES cutoff_", NES_cutoff, ".pdf")), width, height)
+  print(ggplot(fgseaResTidy[fgseaResTidy$padj<0.05 & abs(fgseaResTidy$NES)>NES_cutoff,], aes(reorder(pathway, NES), NES)) + geom_col(aes(fill= ES > 0)) + coord_flip() + labs(x="Pathway", y="Normalized Enrichment Score", title=paste0("Hallmark pathways with q<0.05 from GSEA with NES cutoff: ", NES_cutoff)) + theme_classic())
+  dev.off()
+  return(ranks)
+}
+
+
+```
+
+#Make Object, incorporates feature barcode into the RNA gene expression matrix
+#read cell ranger output. i like to use the h5 file
+```{r load data make assays}
+#get antibody data
+mat<-seul$`Antibody Capture` #This is hashed and APC
+rownames(mat) # Hashtags
+colnames(mat) # barcode names
+
+all.equal(colnames(seu), colnames(mat)) # There appear to be more in colnames(mat), but we only want cells that are in both matrices
+adt_mat<-mat[!grepl("^HT",rownames(mat)),which(colnames(mat) %in% colnames(seu)),drop = F] # Drop the hash tags!
+
+dim(seu)
+dim(adt_mat)
+rownames(adt_mat)
+adt<-CreateAssayObject(counts = adt_mat)
+#add ADT assay
+seu[["ADT"]]<-adt # This adds the feature barcode # (APC-tetramer to the seurat object)
+```
+
+```{r subset RNA}
+DefaultAssay(seu)<-"RNA"
+#add percent.mt to metadata
+seu$percent.mt <- PercentageFeatureSet(seu, pattern = "^mt-") #This is the percentage of mitochondrial genes (low-quality / dying cells often have higher %; common cutoff is 5)
+
+seu$log_RNA<-log10(seu$nCount_RNA)
+# Visualize QC metrics as a violin plot
+VlnPlot(seu, features = c("log_RNA"), pt.size = 0)
+VlnPlot(seu, features=c("percent.mt"), pt.size = 0) #+ylim(c(0,15))
+FeatureScatter(seu, feature1 = "nCount_RNA", feature2 = "percent.mt") # Simple scatter function
+
+#subset RNA data, these are  standard parameters
+seu <- subset(seu, subset = log_RNA > 3.25 & log_RNA < 4.25 & percent.mt < 5)
+```
+
+```{r subset make HTO assay - these are the hash tags}
+# mat is the capture antibody files
+hto_mat<-mat[grep("^HT",rownames(mat)),which(colnames(mat) %in% colnames(seu))] # Only get the data that is also in seurat
+hto<-CreateAssayObject(counts = hto_mat)
+seu[["HTO"]]<-hto
+```
+
+```{r normalize HTO }
+# Normalize HTO data, here we use centered log-ratio (CLR) transformation
+DefaultAssay(seu) <- "HTO"
+seu <- NormalizeData(seu, assay = "HTO", normalization.method = "CLR")
+seu <- ScaleData(seu, assay = "HTO")
+VlnPlot(seu, features = c("nCount_ADT", "nCount_HTO"), pt.size = 0, log = T)
+```
+
+```{r demux HTO }
+# If you have a very large dataset we suggest using k_function = 'clara'. This is a k-medoid
+# clustering function for large applications You can also play with additional parameters (see
+# documentation for HTODemux()) to adjust the threshold for classification Here we are using
+# the default settings
+seu <- HTODemux(seu, assay = "HTO", positive.quantile = 0.99)
+VlnPlot(seu, features  = rownames(seu@assays$HTO), log = T, pt.size = 0)
+# Global classification results
+table(seu$HTO_classification.global)
+
+Idents(seu) <- "HTO_classification.global"
+VlnPlot(seu, features = "log_RNA", pt.size = 0, log = TRUE)
+
+# Extract the singlets
+seu <- subset(seu, idents = "Singlet")
+```
+
+```{r max HTOs}
+Idents(seu) <- "HTO_maxID"
+RidgePlot(seu, assay = "HTO", features = rownames(seu[["HTO"]]))
+```
+
+```{r reduce dimensions and clusters cells}
+# Now we are done with filtering. Time to make a UMAP : - this takes a few minutes to run)
+DefaultAssay(seu) <- "RNA"
+seu <- FindVariableFeatures(seu) # Identifies features that are outliers on a 'mean variability plot'.
+VariableFeatures(seu)# Tells you which were picked
+
+# Remove TCR genes in clustering
+VariableFeatures(seu)<-VariableFeatures(seu)[!grepl("Trav|Trbv|Trdv|Trgv",VariableFeatures(seu))]
+seu <- ScaleData(seu, features = VariableFeatures(seu)) # Scales and centers features in the dataset
+seu <- SCTransform(seu, vars.to.regress = "percent.mt", verbose = T) # Takes a bit of time (several minutes on the cluster)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+#----- Perform linear (PCA) dimensional reduction -----#
+seu <- RunPCA(seu, verbose = T)
+ElbowPlot(seu)
+# 20 dims looks good on elbow plot
+seu <- RunUMAP(seu, dims = 1:20, verbose = T)
+
+#----- Cluster the cells -----#
+seu <- FindNeighbors(seu, dims = 1:20, verbose = T)
+seu <- FindClusters(seu, verbose = T, resolution = 0.4) 
+
+#----- Saved as "Dimplot - UMAP1" -----#
+DimPlot(seu, cols = sfc(16), label = T, label.box = T)+scale_fill_manual(values = rep("white", 20))
+
+```
+
+
+```{r normalize ADT - this is for the APC hashtag}
+seu <- NormalizeData(seu, normalization.method = "CLR", margin = 1, assay = "ADT")
+
+#APC is tetramer
+DefaultAssay(seu)<-"ADT"
+# This plots hash tag features
+FeaturePlot_scCustom(seu, features = "APC", colors_use = viridis_plasma_dark_high, max.cutoff = "q99")
+VlnPlot(seu, features = "APC", pt.size = 0)
+
+```
+
+```{r initial marker genes - just checking a few markers, remove hemoglobin and myeloid cells}
+DefaultAssay(seu)<-"RNA"
+DimPlot(seu, cols = clus_cols, label = T, label.box = T)+scale_fill_manual(values = rep("white", 20))
+Idents(seu)<-"seurat_clusters"
+seu$seurat_clusters
+#----- This function takes about 20-30 minutes -----#
+markers<-FindAllMarkers(seu) # Finds markers (differentially expressed genes) for each of the identity classes in a dataset.  **This function takes some time (~20-30 minutes)
+write.csv(markers, file.path(FIG_DIR, "[Suppl] - FindAllMarkers_preClean.csv")) # Write this out
+top_n<- markers %>%
+group_by(cluster) %>%
+slice_max(n = 20, order_by = avg_log2FC)  # gives you the top differentially expressed genes per popultion
+#----- Clusters original seurat object -----#
+
+#----- Non-T-cell clusters -----#
+top_n[top_n$cluster == 11,] # This cluster has high myeloid genes
+# 1 1.81e- 18       6.00 0.173 0.076 3.51e- 14 11      S100a8 
+# 2 2.35e- 11       5.73 0.135 0.067 4.56e-  7 11      S100a9 
+# 3 9.97e-245       3.49 0.145 0.006 1.93e-240 11      Lcn2   
+# 4 2.58e-301       2.87 0.117 0.003 4.99e-297 11      Chil3  
+# 5 0               2.74 0.567 0.032 0         11      Cd74   
+# 6 0               2.69 0.351 0.007 0         11      Lyz2   
+# 7 0               2.15 0.345 0.012 0         11      Alox5ap
+# 8 0               2.13 0.673 0.019 0         11      Tyrobp 
+# 9 0               2.07 0.726 0.017 0         11      Fcer1g 
+#10 0               2.05 0.383 0.01  0         11      Wfdc17 
+
+top_n[top_n$cluster == 13,] # This cluster has high Hgb genes:
+# 1 0               6.99 0.779 0.013 0         13      Hbb-bs 
+# 2 0               6.07 0.794 0.009 0         13      Hba-a1 
+# 3 0               5.66 0.706 0.005 0         13      Hba-a2 
+# 4 0               4.44 0.745 0.003 0         13      Hbb-bt 
+# 5 5.27e-133       3.85 0.99  0.567 1.02e-128 13      Gpx1   
+# 6 0               3.76 0.926 0.006 0         13      Car2   
+# 7 0               3.46 0.647 0.004 0         13      Alas2  
+# 8 0               3.18 0.946 0.053 0         13      Blvrb  
+# 9 3.08e-125       3.18 0.971 0.483 5.96e-121 13      Prdx2  
+#10 0               3.12 0.882 0.009 0         13      Cd24a  
+
+top_n[top_n$cluster == 12,] # This cluster is Trbv29 / Trav19 (Not Marilyn or CBir1 Tg)
+# 1 0              3.26  0.996 0.004 0         12      Trbv29  
+# 2 9.03e-117      2.89  0.991 0.624 1.75e-112 12      Ccl5   
+# 3 0              1.97  0.9   0.003 0         12      Trav19  
+# 4 1.04e- 37      1.73  0.597 0.269 2.02e- 33 12      Gzma    
+# 5 3.80e- 83      1.40  0.991 0.514 7.37e- 79 12      Nkg7  
+# 6 1.22e- 66      1.36  0.996 0.619 2.37e- 62 12      S100a6  
+# 7 1.44e- 38      1.09  0.965 0.726 2.78e- 34 12      Lgals1  
+# 8 2.09e- 40      1.09  0.965 0.742 4.05e- 36 12      H2afz   
+# 9 2.07e- 57      1.08  0.996 0.784 4.01e- 53 12      S100a10 
+# 10 5.23e- 52      1.06  0.805 0.354 1.01e- 47 12      Gzmb    
+
+top_n[top_n$cluster == 8,] # This cluster has cycling genes (MKi67)
+# 1     0       3.27 0.888 0.149         0 8       Hist1h1b 
+# 2     0       2.88 0.987 0.641         0 8       Hmgb2    
+# 3     0       2.87 0.821 0.091         0 8       Hist1h2ae
+# 4     0       2.87 0.901 0.166         0 8       Stmn1    
+# 5     0       2.83 0.973 0.107         0 8       Mki67    
+# 6     0       2.75 0.902 0.355         0 8       Hist1h1e 
+# 7     0       2.69 0.978 0.577         0 8       Tubb5    
+# 8     0       2.62 0.817 0.145         0 8       Ube2c    
+# 9     0       2.57 0.887 0.187         0 8       H2afx    
+#10     0       2.56 0.894 0.095         0 8       Birc5 
+
+
+top_n[top_n$cluster == 3,] # This cluster is Trbv19 / Trav7-3 (Marilyn Tg) 
+# 1 0              1.30  0.978 0.549 0         3       Trbv19  
+# 2 0              0.873 0.993 0.868 0         3       Ifi27l2a #Interferon-alpha-inducible protein 27 like 2A
+# 3 0              0.773 0.769 0.327 0         3       Trav7-3 
+# 4 0              0.771 0.737 0.356 0         3       Slamf6 
+# 5 0              0.729 0.659 0.301 0         3       Sde2  
+# 6 8.82e- 63      0.687 1     0.999 1.71e- 58 3       Gm42418
+# 7 1.28e-234      0.667 0.459 0.205 2.49e-230 3       Lefty2 
+# 8 4.73e- 45      0.626 0.993 0.987 9.17e- 41 3       Cdk8 
+# 9 8.77e-279      0.615 0.996 0.987 1.70e-274 3       Malat1  
+#10 1.51e-283      0.602 0.857 0.61  2.92e-279 3       Gm8369  
+
+top_n[top_n$cluster == 4,] # Marilyn Group  
+# 1     0      2.17  0.998 0.845         0 4       Dock2 
+# 2     0      1.86  0.972 0.578         0 4       Itga4   
+# 3     0      1.60  0.939 0.368         0 4       Atxn1  
+# 4     0      1.45  0.894 0.362         0 4       Ahnak   
+# 5     0      1.44  0.88  0.273         0 4       Arhgap26
+# 6     0      1.42  0.865 0.41          0 4       Itgb1  
+# 7     0      1.32  0.992 0.832         0 4       Mbnl1  
+# 8     0      1.30  0.989 0.877         0 4       Arhgap15
+# 9     0      1.29  0.88  0.425         0 4       Maml2   
+#10     0      1.28  0.936 0.541         0 4       Themis   
+
+top_n[top_n$cluster == 5,] # This cluster is Trbv19 (Marilyn Tg);
+# 1     0       1.80 0.928 0.346         0 5       Anxa2  
+# 2     0       1.54 0.998 0.87          0 5       Ifi27l2a 
+# 3     0       1.52 0.992 0.85          0 5       Crip1 
+# 4     0       1.48 0.969 0.709         0 5       Lgals1 
+# 5     0       1.46 0.941 0.632         0 5       Hmgb2  
+# 6     0       1.40 0.962 0.596         0 5       S100a6  
+# 7     0       1.40 0.913 0.629         0 5       Vim     
+# 8     0       1.40 0.976 0.725         0 5       H2afz   
+# 9     0       1.32 0.992 0.769         0 5       S100a10 
+#10     0       1.28 0.878 0.482         0 5       Ly6c2   
+
+top_n[top_n$cluster == 7,] # This cluster is Trbv19 (Marilyn Tg)
+# 1 0              3.46  0.997 0.607 0         7       Ccl5
+# 2 0              1.46  0.993 0.493 0         7       Nkg7    
+# 3 0              1.20  0.861 0.288 0         7       Gzmk    
+# 4 0              1.10  0.929 0.489 0         7       Ly6c2
+# 5 2.04e-277      1.10  0.741 0.338 3.96e-273 7       Gzmb    
+# 6 0              1.02  0.986 0.568 0         7       Trbv19  
+# 7 0              0.957 0.906 0.407 0         7       Hopx    
+# 8 0              0.917 0.986 0.781 0         7       AW112010
+# 9 5.60e-275      0.800 0.949 0.667 1.09e-270 7       Abracl  
+#10 4.97e-248      0.786 0.998 0.873 9.63e-244 7       Ifi27l2a
+
+top_n[top_n$cluster == 9,] # What is TCR(Marilyn Tg?) 
+# 1 0               3.96 0.729 0.093 0         9       Ifitm1
+# 2 0               3.52 0.749 0.253 0         9       Gzma   
+# 3 0               2.25 0.865 0.29  0         9       Ifitm3 
+# 4 0               2.17 0.704 0.099 0         9       Ifitm2 
+# 5 0               1.97 0.992 0.717 0         9       Lgals1 
+# 6 0               1.87 0.995 0.607 0         9       S100a6 
+# 7 0               1.78 0.831 0.272 0         9       Lgals3 
+# 8 0               1.56 0.994 0.777 0         9       S100a10
+# 9 2.14e-291       1.46 0.791 0.34  4.15e-287 9       Gzmb   
+#10 6.87e-109       1.46 0.808 0.619 1.33e-104 9       Ccl5   
+
+top_n[top_n$cluster == 2,] # This cluster is Trbv19 (Marilyn Tg) 
+# 1     0      1.25  0.985 0.557         0 2       S100a6  
+# 2     0      1.12  0.742 0.289         0 2       Gzmb    
+# 3     0      1.06  0.795 0.241         0 2       S100a4  
+# 4     0      1.05  0.985 0.75          0 2       S100a10 
+# 5     0      1.04  0.828 0.304         0 2       Id2    
+# 6     0      1.02  0.981 0.757         0 2       AW112010
+# 7     0      1.02  0.98  0.7           0 2       Lsp1    
+# 8     0      1.00  0.997 0.859         0 2       Ifi27l2a
+# 9     0      0.999 0.993 0.517         0 2       Trbv19  
+#10     0      0.996 0.958 0.439         0 2       Nkg7    
+
+#----- CBir1 Tg Clusters -----#
+top_n[top_n$cluster == 0,] # This cluster is CBir1 T cells (Trbv13-1) - Fos/Junb high
+# 1     0      1.55  0.998 0.693         0 0       Trbv13-1
+# 2     0      1.46  0.987 0.793         0 0       Junb    
+# 3     0      1.06  0.754 0.388         0 0       Fos     
+# 4     0      0.893 0.666 0.168         0 0       Ly6c1   
+# 5     0      0.854 0.91  0.675         0 0       Nfkbia  
+# 6     0      0.768 0.745 0.382         0 0       Ppp1r15a
+# 7     0      0.766 0.686 0.355         0 0       Dusp1   
+# 8     0      0.714 0.809 0.622         0 0       Zfp36   
+# 9     0      0.691 0.908 0.689         0 0       Pnrc1   
+#10     0      0.682 0.999 0.948         0 0       Rps27 
+
+top_n[top_n$cluster == 6,] # This cluster is CBir1 T cells (Trbv13-1)
+# 1 0              1.64  1     0.987 0         6       Cdk8    
+# 2 0              1.58  1     0.999 0         6       Gm42418 
+# 3 4.32e-251      1.33  0.949 0.846 8.37e-247 6       Camk1d  
+# 4 0              1.26  0.973 0.839 0         6       Il31ra 
+# 5 1.81e-285      1.24  0.938 0.78  3.51e-281 6       Gphn    
+# 6 0              1.22  0.995 0.923 0         6       Lars2   
+# 7 0              1.08  1     0.974 0         6       Cmss1   
+# 8 2.09e-156      1.02  0.771 0.564 4.05e-152 6       Gm26561 
+# 9 0              1.01  0.979 0.735 0         6       Trbv13-1
+#10 6.75e-270      0.860 0.953 0.821 1.31e-265 6       Junb    
+
+top_n[top_n$cluster == 10,] # This cluster is mostly CBir1 Ts
+# 1 0               2.19 0.988 0.626 0         10      Inpp4b  
+# 2 0               1.92 0.999 0.883 0         10      Arhgap15
+# 3 0               1.74 0.933 0.37  0         10      Bach2   
+# 4 9.82e-241       1.71 0.916 0.546 1.90e-236 10      Bcl2    
+# 5 0               1.65 0.953 0.505 0         10      Foxp1   
+# 6 6.34e-299       1.63 1     0.854 1.23e-294 10      Dock2   
+# 7 9.72e-270       1.44 0.908 0.451 1.88e-265 10      Maml2   
+# 8 1.15e-282       1.42 0.964 0.574 2.24e-278 10      Elmo1   
+# 9 1.03e-279       1.38 0.997 0.841 2.00e-275 10      Mbnl1   
+#10 2.57e-272       1.37 0.957 0.561 4.98e-268 10      Ankrd44 
+
+top_n[top_n$cluster == 14,] # This cluster is Trbv13-1 FoxP3 Treg (CBir1 Tg)
+# 1 3.63e- 44      1.92  1     0.751 7.03e- 40 14      Trbv13-1
+# 2 3.91e-121      1.84  0.673 0.083 7.58e-117 14      Ikzf2   
+# 3 4.36e- 31      1.17  1     0.955 8.44e- 27 14      Trbc2   
+# 4 4.08e-104      1.12  0.445 0.04  7.90e-100 14      Cd74    
+# 5 3.54e- 33      1.02  0.7   0.269 6.86e- 29 14      Capg    
+# 6 6.98e- 16      0.992 0.9   0.649 1.35e- 11 14      Vim     
+# 7 0              0.966 0.482 0.006 0         14      Foxp3   
+# 8 3.08e- 45      0.950 0.545 0.124 5.97e- 41 14      Tnfrsf4 
+# 9 4.35e- 17      0.874 0.818 0.521 8.44e- 13 14      Hsp90b1 
+#10 9.68e- 53      0.831 0.209 0.017 1.88e- 48 14      Klrg1  
+
+
+# As we are focused on CBir1 and Marilyn Ts, we will remove cluster 13 (RBCs), cluster 11 (myeloid), and cluster 12 (non-Marilyn, non-CBir1 TCRs)
+FeaturePlot_scCustom(seu, features = c("Hbb-bs", "Hba-a1","Fcer1g","Cd33","H2-Aa", "Trbv29","Trbv19", "Trbv13-1"), colors_use = rna_cols)
+seu<-seu[,(seu$seurat_clusters != 13 & seu$seurat_clusters != 11 & seu$seurat_clusters != 12)]
+```
+
+
+```{r - dimensional reduction}
+# Re-reduce dimensions as we have subsetted cells
+
+DefaultAssay(seu) <- "RNA"
+seu <- FindVariableFeatures(seu)#, selection.method = "mean.var.plot")
+seu <- ScaleData(seu, features = VariableFeatures(seu))
+seu <- SCTransform(seu, vars.to.regress = "percent.mt", verbose = T)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+VariableFeatures(seu)<-VariableFeatures(seu)[!grepl("Trav|Trbv|Trdv|Trgv", VariableFeatures(seu))] 
+
+seu <- RunPCA(seu, verbose = T)
+ElbowPlot(seu)
+#20 dims looks good
+# perform visualization and clustering steps
+seu <- RunUMAP(seu, dims = 1:20, verbose = T)
+seu <- FindNeighbors(seu, dims = 1:20, verbose = T)
+seu <- FindClusters(seu, verbose = T, resolution = 0.3, algorithm = 1 , graph.name = "SCT_snn", random.seed = 123) 
+# I used resolution of 0.3 for final, this gave me 11 clusters - this shows the Tregs nicely
+DimPlot(seu, cols = sfc(16), label = T, label.box = T)+scale_fill_manual(values = rep("white", 20))
+```
+
+
+#ID Exp groups
+Group 1-1	HT1	ACCCACCAGTAAGAC
+Group 1-2	HT2	GGTCGAGAGCATTCA
+Group 1-3	HT3	CTTGCCGCATGTCAT
+Group 2-1	HT4	AAAGCATTCTTCACG
+Group 2-2	HT5	CTTTGTCTTTGTGAG
+Group 2-3	HT6	TATGCTGCCACGGTA
+Group 2-4	HT7	GAGTCTGCCAGTATC
+Group 3-1	HT8	TATAGAACGCCAGGC
+Group 3-2	HT9	TGCCTATGAAACAAG
+Group 3-3	HT10	CCGATTGTAACAGAC
+CBir1 Tetramer	TTAACCGTCTCCCTT
+
+```{r # Group 1, 2, and 3 replicates}
+
+#----- Create another variable to denote each replicate -----#
+seu$rep<-seu$HTO_maxID
+table(seu$HTO_maxID)
+
+seu$rep[seu$HTO_maxID == "HT1"]<-"M1"
+seu$rep[seu$HTO_maxID == "HT2"]<-"M2"
+seu$rep[seu$HTO_maxID == "HT3"]<-"M3"
+seu$rep[seu$HTO_maxID == "HT4"]<-"B1"
+seu$rep[seu$HTO_maxID == "HT5"]<-"B2"
+seu$rep[seu$HTO_maxID == "HT6"]<-"B3"
+seu$rep[seu$HTO_maxID == "HT7"]<-"B4"
+seu$rep[seu$HTO_maxID == "HT8"]<-"C1"
+seu$rep[seu$HTO_maxID == "HT9"]<-"C2"
+seu$rep[seu$HTO_maxID == "HT10"]<-"C3"
+
+#----- Create another variable to denote each group -----#
+seu$group<-seu$rep
+seu$group[grep("M",seu$rep)]<-"group1"
+seu$group[grep("B",seu$rep)]<-"group2"
+seu$group[grep("C",seu$rep)]<-"group3"
+
+DimPlot(seu, group.by = "rep", cols = sfc(10))
+DimPlot(seu, group.by = "group", cols = sfc(3))
+```
+
+#Add TCR data
+```{r - Adding TCR data}
+colnames(seu)
+bcs<-colnames(seu)
+
+tcr_load<-read.csv(file.path(DATA_DIR, x, "outs/per_sample_outs", x, "vdj_t/filtered_contig_annotations.csv"))
+tcr_load$barcode
+
+#check barcode prefixes
+tcr_load$barcode  %>% head()
+bcs %>% head()
+length(intersect(tcr_load$barcode,bcs))
+length(unique(bcs))
+length(unique(tcr_load$barcode))
+tcr_load$umis
+
+#CombineTCR: This function consolidates a list of TCR sequencing results to the level of the individual cell barcodes. Using the samples and ID parameters, the function will add the strings as prefixes to prevent issues with repeated barcodes. The resulting new barcodes will need to match the Seurat or SCE object in order to use, combineExpression. Several levels of filtering exist - remove or filterMulti are parameters that control how the function deals with barcodes with multiple chains recovered.
+tcr<-combineTCR(list(tcr_load), samples = "AY_cBIR_1", cells ="T-AB") 	
+#cells = The type of T cell - T cell-AB or T cell-GD. Only 1 T cell type can be called at once.
+tcr$AY_cBIR_1$barcode
+tcr[[1]]$barcode<-gsub("AY_cBIR_1_", "",tcr[[1]]$barcode ) #gets rid of the prefix
+
+tcr$AY_cBIR_1$barcode
+#make sure the barcodes match
+tcr[[1]]$barcode %in% colnames(seu) %>% table()
+
+#----- Only select the TCRs that match with object-----#
+tcr_df<-tcr[[1]][tcr[[1]]$barcode%in% colnames(seu),] # These are the TCRs identified
+table(tcr_df$CTaa) %>% data.frame() # Alpha and beta genes
+table(tcr_df$barcode%in% colnames(seu)) # Should be all true now
+
+# add to seurat objects
+# This function adds the immune receptor information to the Seurat or SCE object to the meta data. 
+seu <- combineExpression(list(tcr_df), seu, 
+                         cloneCall="aa", 
+                         proportion = F) 
+
+```
+
+
+# Save object
+```{r}
+saveRDS(seu, file.path(FIG_DIR, "AY_cBIR_seurat_cleaned.rds"))
+```
+
+# Load object
+```{r}
+seu<-readRDS(file.path(CDS_DIR, "AY_cBIR_seurat_cleaned.rds"))
+```
+
+
+```{r - Figures for publication}
+#========== Fig 5B ==========#
+DefaultAssay(seu)<-"RNA"
+markers<-FindAllMarkers(seu) # Finds markers (differentially expressed genes) for each of the identity classes in a dataset.  **This function takes some time (~20-30 minutes)
+write.csv(markers, file.path(FIG_DIR, "[Suppl] - FindAllMarkers.csv")) # Write this out
+
+#---- Plot all groups ----#
+pdf(file.path(FIG_DIR, "[Fig 5B] - group_umap.pdf"), width = 6, height = 5)
+DimPlot(seu, group.by = "group", pt.size = 0.2, cols = brewer.set1(n=3), label = F, label.box = F)+scale_fill_manual(values = rep("white", 3))&NoAxes()
+dev.off()
+
+#---- CAVTGNYKYVF_CASTSGGLSYEQYF CBir TCRB with alpha pairing ----#
+#----  CAVGNNNNAPRF_CASSIPGSNERLFF Marilyn TCRB and alpha ----#
+#----- Plot TCRBs individually -----#
+DefaultAssay(seu)<-"RNA"
+seu$CBir1Beta_alpha <- grepl("CASTSGGLSYEQYF",seu$CTaa) & grepl("CAVTGNYKYVF",seu$CTaa)
+seu$MarilynBeta_alpha <- grepl("CASSIPGSNERLFF",seu$CTaa) & grepl("CAVGNNNNAPRF",seu$CTaa)
+
+col<-brewer.set1(n=3)[2:3]
+pdf(file.path(FIG_DIR, "[Fig 5B] - CBir1_TCRAB.pdf"), width = 6, height = 5)
+DimPlot(seu, cells=seu$CBir1Beta_alpha, group.by = "group", pt.size = 2, cols = col)&NoAxes()
+dev.off()
+
+col<-brewer.set1(n=3)
+pdf(file.path(FIG_DIR, "[Fig 5B] - Marilyn_TCRAB.pdf"), width = 6, height = 5)
+DimPlot(seu, cells=seu$MarilynBeta_alpha, group.by = "group",pt.size = 2, cols = col)&NoAxes()
+dev.off()
+
+#----- Plot Tetramer Hashtag -----#
+DefaultAssay(seu)<-"ADT"
+pdf(file.path(FIG_DIR, "[Fig 5B] - CBir1 Tetramer.pdf"), width = 6, height = 5)
+FeaturePlot_scCustom(seu, features = "APC", colors_use = viridis_plasma_dark_high, max.cutoff = "q99",pt.size = 0.2,)&NoAxes()
+dev.off()
+
+
+#========== Fig 5C ==========#
+#----- UMAP plot of clusters (unbiased) -----#
+DefaultAssay(seu)<-"RNA"
+pdf(file.path(FIG_DIR, "[Fig 5C] - clusters_umap2.pdf"), width = 6, height = 5)
+DimPlot(seu, cols = sfc(16), label = T, label.size = 10, pt.size = 0.2, label.box = F)+scale_fill_manual(values = rep("white", 20))&NoAxes()
+dev.off()
+
+#----- Cellularity across clusters -----$
+
+#--- For CBir1 Tg TCRs ---#
+df1<- data.frame(table(seu$seurat_clusters[(seu$CBir1Beta_alpha=="TRUE") & seu$group =="group2"], seu$group[(seu$CBir1Beta_alpha=="TRUE") & seu$group =="group2"]))
+pdf(file.path(FIG_DIR, "[Fig 5C] - Group2 CBir1.pdf"), width = 6, height = 5)
+ggplot(df1, aes(fill = Var1, y=Freq, x=Var2)) + 
+    geom_bar(stat = "identity",  position = "fill")+scale_fill_manual(values = sfc(16))+theme_classic()+RotatedAxis()+NoGrid()+coord_polar("y", start=0)&NoAxes()
+dev.off()
+
+df2<- data.frame(table(seu$seurat_clusters[(seu$CBir1Beta_alpha=="TRUE") & seu$group =="group3"], seu$group[(seu$CBir1Beta_alpha=="TRUE") & seu$group =="group3"]))
+pdf(file.path(FIG_DIR, "[Fig 5C] - Group3 CBir1.pdf"), width = 6, height = 5)
+ggplot(df2, aes(fill = Var1, y=Freq, x=Var2)) + 
+    geom_bar(stat = "identity",  position = "fill")+scale_fill_manual(values = sfc(16))+theme_classic()+RotatedAxis()+NoGrid() + coord_polar("y", start=0)&NoAxes()
+dev.off()
+
+#--- For Marilyn Tg TCRs ---#
+dfm1<- data.frame(table(seu$seurat_clusters[(seu$MarilynBeta_alpha=="TRUE") & seu$group =="group1"], seu$group[(seu$MarilynBeta_alpha=="TRUE") & seu$group =="group1"]))
+pdf(file.path(FIG_DIR, "[Fig 5C] - Group1 Marilyn.pdf"), width = 6, height = 5)
+ggplot(dfm1, aes(fill = Var1, y=Freq, x=Var2)) + 
+    geom_bar(stat = "identity",  position = "fill")+scale_fill_manual(values = sfc(16))+theme_classic()+RotatedAxis()+NoGrid() +coord_polar("y", start=0)&NoAxes()
+dev.off()
+
+dfm2<- data.frame(table(seu$seurat_clusters[(seu$MarilynBeta_alpha=="TRUE") & seu$group =="group2"], seu$group[(seu$MarilynBeta_alpha=="TRUE") & seu$group =="group2"]))
+pdf(file.path(FIG_DIR, "[Fig 5C] - Group2 Marilyn.pdf"), width = 6, height = 5)
+ggplot(dfm2, aes(fill = Var1, y=Freq, x=Var2)) + 
+    geom_bar(stat = "identity",  position = "fill")+scale_fill_manual(values = sfc(16))+theme_classic()+RotatedAxis()+NoGrid() + coord_polar("y", start=0)&NoAxes()
+dev.off()
+```
+
+
+```{r Figures for publication - looking at gene clusters - Fig 5C}
+# Use propeller to compare cluster proportions between biological replicates
+# PMID: 36005887
+# Bioinformatics. 2022 Oct 15; 38(20): 4720–4726.
+# https://github.com/Oshlack/speckle
+devtools::install_github("Oshlack/speckle")
+library(speckle)
+library(limma)
+library(ggplot2)
+library(ggthemes)
+library(scales)
+
+#---- Plot only CBir1s from group 2 and 3 ----#
+seu_subset_CBir1 <- subset(seu, subset = (group == "group2" | group == "group3") & CBir1Beta_alpha)
+
+pdf(file.path(FIG_DIR, "[Fig 5C] - Propeller_plot_CBir1s.pdf"), width = 4, height = 8)
+plotCellTypeProps(clusters=seu_subset_CBir1$seurat_clusters, sample=seu_subset_CBir1$rep)+ scale_fill_manual(values=c(sfc(16)[1:2],sfc(16)[11:12],sfc(16)[3:10]))+ theme_classic()
+dev.off()
+
+CBir1_values <- propeller(clusters = seu_subset_CBir1$seurat_clusters, sample = seu_subset_CBir1$rep, group = seu_subset_CBir1$group)
+
+color <- sfc(16)[CBir1_values$BaselineProp.clusters]
+pdf(file.path(FIG_DIR, "[Fig 5C] - CBir1 ClusterFDRs.pdf"), width = 4, height = 4)
+barplot(CBir1_values$FDR, log='y', ylab="FDR", xlab="Cluster",names.arg=CBir1_values$BaselineProp.clusters,col=color,cex.names=0.5,cex.axis=0.5)
+dev.off()
+
+#---- Plot only Marilyns from group 1 and 2 ----#
+seu_subset_Marilyn<- subset(seu, subset = (group == "group1" | group == "group2") & MarilynBeta_alpha)
+
+pdf(file.path(FIG_DIR, "[Fig 5C] - Propeller_plot_Marilyns.pdf"), width = 4, height = 8)
+plotCellTypeProps(clusters=seu_subset_Marilyn$seurat_clusters, sample=seu_subset_Marilyn$rep)+ scale_fill_manual(values=c(sfc(16)[1:2],sfc(16)[11:12],sfc(16)[3:10]))+ theme_classic()
+dev.off()
+
+Marilyn_values <- propeller(clusters = seu_subset_Marilyn$seurat_clusters, sample = seu_subset_Marilyn$rep, group = seu_subset_Marilyn$group)
+
+color <- sfc(16)[Marilyn_values$BaselineProp.clusters]
+pdf(file.path(FIG_DIR, "[Fig 5C] - Marilyn ClusterFDRs.pdf"), width = 4, height = 4)
+barplot(Marilyn_values$FDR, ylab="FDR", xlab="Cluster",names.arg=Marilyn_values$BaselineProp.clusters,col=color,cex.names=0.5,cex.axis=0.5)
+dev.off()
+```
+
+
+```{r Figures for publication - Fig 5D dot plots}
+#========== Fig 5D ==========#
+genes_pub<-c("Trbv13-1","Trbv19","Cd44","Sell", "Cd69","Ccr7","Tcf7","Tbx21", "Ifng", "Cxcr6","Nkg7","Gzmb","Foxp3", "Fos","Junb","Mki67")
+
+pdf(file.path(FIG_DIR, "[Fig 5D] - Dot Plot_SCT.pdf"), width = 5, height = 5)
+SCpubr::do_DotPlot(seu, features = genes_pub, cluster.idents = T, group.by = "seurat_clusters", assay = "SCT")+scale_fill_gradientn(colours = rna_cols)
+dev.off()
+```
+
+
+```{r - GSEA Figures - 5E}
+
+#========== Figure 5E GSEA ==========#
+#---- GSEA analysis using fsgea ----#
+#https://crazyhottommy.github.io/scRNA-seq-workshop-Fall-2019/scRNAseq_workshop_3.html
+library(presto)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+seu.genes <- wilcoxauc(seu, 'seurat_clusters')
+# for GSEA, we need the information of all genes, Seurat is just too slow if we test
+# all 20,000 genes. instead let's try presto which performs a fast Wilcoxon rank sum test 
+
+#---- Hallmark Gene Sets ----#
+m_t2g <- msigdbr(species = "mouse", category = "H") %>% dplyr::select(gs_name, gene_symbol) 
+
+fsgea_0_ranks <- plot_fsgea_bargraph(m_t2g,seu.genes,"0","Hallmark Set",5, height=2, width=6)
+fsgea_1_ranks <- plot_fsgea_bargraph(m_t2g,seu.genes,"1","Hallmark Set",5, height=2, width=6)
+
+fgsea_sets<- m_t2g %>% split(x = .$gene_symbol, f = .$gs_name) #Collects names of the genes of interest
+
+#GSEA style plot
+pdf(file.path(FIG_DIR, "[Fig 5E] - GSEA_Enrichment_Gp0 H_OXPHOS.pdf"), width = 5, height = 2.5)
+plotEnrichment(fgsea_sets[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]],
+               fsgea_0_ranks, ticksSize = 0.5) + labs(title="HALLMARK_OXIDATIVE_PHOSPHORYLATION")
+dev.off()
+
+pdf(file.path(FIG_DIR, "[Fig 5E] - GSEA_Enrichment_Gp0 H_TNF.pdf"), width = 5, height = 2.5)
+plotEnrichment(fgsea_sets[["HALLMARK_TNFA_SIGNALING_VIA_NFKB"]],
+               fsgea_0_ranks, ticksSize = 0.5) + labs(title="HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+dev.off()
+
+pdf(file.path(FIG_DIR, "[Fig 5E] - GSEA_Enrichment_Gp1 H_OXPHOS.pdf"), width = 5, height = 2.5)
+plotEnrichment(fgsea_sets[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]],
+               fsgea_1_ranks, ticksSize = 0.5) + labs(title="HALLMARK_OXIDATIVE_PHOSPHORYLATION")
+dev.off()
+
+pdf(file.path(FIG_DIR, "[Fig 5E] - GSEA_Enrichment_Gp1 H_TNF.pdf"), width = 5, height = 2.5)
+plotEnrichment(fgsea_sets[["HALLMARK_TNFA_SIGNALING_VIA_NFKB"]],
+               fsgea_1_ranks, ticksSize = 0.5) + labs(title="HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+dev.off()
+
+#------ Plot gene signatures onto map ------#
+rna_cols<-paletteContinuous(n=8)[c(1:3, 6:8)]
+
+#get  gene list
+pdf(file.path(FIG_DIR, "[Fig 5E] - GSEA_H_TNF Cluster.pdf"), width = 6, height = 5)
+bac<-msig[msig$gs_name == "HALLMARK_TNFA_SIGNALING_VIA_NFKB",]$gene_symbol
+DefaultAssay(seu)<-"SCT"
+seu<-AddModuleScore(seu, features = list(bac), name = "H_TNF")
+FeaturePlot_scCustom(seu, features = "H_TNF1", label = F, label.size = 2, pt.size = 0.2, max.cutoff = "q99")+scale_color_gradientn(colors = rna_cols)&NoAxes()
+dev.off()
+
+pdf(file.path(FIG_DIR, "[Fig 5E] - GSEA_H_OXPHOS Cluster.pdf"), width = 6, height = 5)
+bac<-msig[msig$gs_name == "HALLMARK_OXIDATIVE_PHOSPHORYLATION",]$gene_symbol
+seu<-AddModuleScore(seu, features = list(bac), name = "H_OXPHOS")
+FeaturePlot_scCustom(seu, features = "H_OXPHOS1", label = F, label.size = 2, pt.size = 0.2, max.cutoff = "q99")+scale_color_gradientn(colors = rna_cols)&NoAxes()
+dev.off()
+
+```
