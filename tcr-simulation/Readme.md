@@ -34,7 +34,7 @@ donor_file <- fread("1901T-donor-spleen-all-supermerge.csv") #Specify file name
 ```
 The output of the above file should be named `exp_coeff_matrix.csv` and represents the coefficients for the log-log plot of the TCR clonality sizes vs. frequency. This is necessary to generate a "prior probability" for downstream Bayesian analysis.
 
-Now, let's download 2 recipient data file (see Zenodo link under samples folder). To begin with, we can download the following files: `1901T-Gp1-1-spleen.tsv` and `1901T-Gp1-2-spleen.tsv`.  Place these two files in the same directory as `exp_coeff_matrix.csv` and '1901T-donor-spleen-all-supermerge.csv'.
+Now, let's download 2 recipient data file (see Zenodo link under samples folder). To begin with, we can download the following files: `1901T-Gp1-1-spleen.tsv` and `1901T-Gp1-2-spleen.tsv`.  Place these two files in the same directory as `exp_coeff_matrix.csv` and `1901T-donor-spleen-all-supermerge.csv`.
 
 Next, download the script "[Cluster] Publication - Selective Expanders.R", change the working directory in the script to where the donor data file is located, and make sure the proper donor file is referred to in the script:
 ```
