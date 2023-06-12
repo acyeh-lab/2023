@@ -1,4 +1,4 @@
-To access sample data sets used to generate Figure 3D (B6 to B6D2F1 twin transplant systems), please download donor and recipient files from "https://doi.org/10.5281/zenodo.7406937"
+To access sample data sets used to generate Figure 2H (B6 to B6D2F1 twin transplant systems), please download donor and recipient files from "https://doi.org/10.5281/zenodo.7406937"
 
 Donor files: `1901T-donor-spleen-all-supermerge.csv` (summed file from 4 deep sequencing samples)
 
